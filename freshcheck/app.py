@@ -80,9 +80,28 @@ def worklist():
 @app.get("/arrivals")
 def arrivals():
     query = (request.args.get("q") or "").strip()
+    fragment = service.parse_fragment(query)
+    # A cursor only means something for an indexed fragment query; ignore it
+    # for a legacy query so a stale link cannot hide rows.
+    after = (request.args.get("after") or "").strip() if fragment else ""
     with read_conn(get_db_path()) as conn:
-        rows = service.list_arrivals(conn, query)
-    return render_template("arrivals.html", rows=rows, query=query)
+        if fragment is None:
+            rows = [dict(row) for row in service.list_arrivals(conn, query)]
+            page = {"rows": rows, "total": len(rows), "has_more": False, "next_after": "", "fragment": None}
+        else:
+            page = service.search_arrivals(conn, fragment, after=after)
+            page["fragment"] = fragment
+    return render_template(
+        "arrivals.html",
+        rows=page["rows"],
+        query=query,
+        fragment=fragment,
+        after=after,
+        total=page["total"],
+        has_more=page["has_more"],
+        next_after=page["next_after"],
+        page_size=service.SEARCH_PAGE_SIZE,
+    )
 
 
 @app.get("/arrivals/<arrival_no>")

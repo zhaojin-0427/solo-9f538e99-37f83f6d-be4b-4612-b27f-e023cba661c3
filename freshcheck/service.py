@@ -14,12 +14,19 @@ worklists and release flags remain exactly as they were.
 
 from __future__ import annotations
 
+import re
 import sqlite3
 
 from . import rules
 from .csvio import KINDS, parse_csv
 from .db import utc_now
 from .sqlutil import chunks, placeholders
+
+#: A "fragment" is what an inspector can still read off a torn carton label:
+#: 3-8 ASCII letters/digits, matched anywhere in the arrival number, purchase
+#: line number or scanned barcode.  Anything else keeps the legacy lookup.
+FRAGMENT_PATTERN = re.compile(r"[A-Za-z0-9]{3,8}")
+SEARCH_PAGE_SIZE = 50
 
 UPSERT = {
     "arrivals": (
@@ -208,6 +215,126 @@ def list_arrivals(conn: sqlite3.Connection, query: str = "") -> list[sqlite3.Row
         params = (like, like, like)
     sql += " ORDER BY a.arrival_no"
     return conn.execute(sql, params).fetchall()
+
+
+def parse_fragment(query: str) -> str | None:
+    """Return the normalised search fragment, or ``None`` for a legacy query.
+
+    Only a 3-8 character ASCII alphanumeric string selects the indexed
+    fragment lookup; everything else (empty, shorter, longer, spaces,
+    punctuation, non-ASCII) keeps the original substring search.
+    """
+    normalized = (query or "").strip()
+    if FRAGMENT_PATTERN.fullmatch(normalized):
+        return normalized
+    return None
+
+
+def search_arrivals(
+    conn: sqlite3.Connection,
+    fragment: str,
+    after: str = "",
+    limit: int = SEARCH_PAGE_SIZE,
+) -> dict:
+    """One page of arrivals whose number/line/barcode contain ``fragment``.
+
+    Matching is case-insensitive for ASCII letters (the trigram tokenizer folds
+    case) and covers all three identifiers; an arrival matching on more than
+    one column is returned once because the index has one row per arrival.
+
+    Ordering is by arrival number.  ``after`` is the arrival number of the last
+    row of the previous page: the next page is the set that *still* matches
+    when read, with an arrival number strictly greater than it.  The result
+    therefore never shifts with inserts/deletes that land before the cursor.
+
+    Only this page's arrival rows and their blocking-issue rows are read; the
+    remaining matches are counted by the index without materialising them.
+    """
+    match = _fts_phrase(fragment)
+    page_sql = """
+        SELECT a.arrival_no
+          FROM arrivals a
+         WHERE a.arrival_no > ?
+           AND a.rowid IN (
+                 SELECT rowid FROM arrival_search WHERE arrival_search MATCH ?
+               )
+         ORDER BY a.arrival_no
+         LIMIT ?
+    """
+    # Fetch one extra row to know whether another page exists without a
+    # second scan.
+    keys = [
+        row["arrival_no"]
+        for row in conn.execute(page_sql, (after, match, limit + 1)).fetchall()
+    ]
+    has_more = len(keys) > limit
+    keys = keys[:limit]
+    total = conn.execute(
+        "SELECT COUNT(*) AS n FROM arrival_search WHERE arrival_search MATCH ?",
+        (match,),
+    ).fetchone()["n"]
+    return {
+        "rows": _arrival_rows(conn, keys),
+        "total": total,
+        "page_size": limit,
+        "has_more": has_more,
+        "next_after": keys[-1] if has_more else "",
+    }
+
+
+def _fts_phrase(fragment: str) -> str:
+    """Quote a fragment as a single FTS5 phrase (no operator interpretation)."""
+    return '"' + fragment.replace('"', '""') + '"'
+
+
+def _arrival_rows(conn: sqlite3.Connection, keys: list[str]) -> list[dict]:
+    """Read exactly the given arrivals and their issues, in one snapshot.
+
+    Both statements run on the caller's read connection/transaction, so the
+    stored release flag and the issue detail come from the same committed
+    data.  ``issue_count`` is derived from those very issue rows.
+    """
+    if not keys:
+        return []
+    marks = placeholders(len(keys))
+    arrivals = conn.execute(
+        f"""
+        SELECT arrival_no, po_line_no, barcode, arrived_at
+          FROM arrivals
+         WHERE arrival_no IN ({marks})
+         ORDER BY arrival_no
+        """,
+        tuple(keys),
+    ).fetchall()
+    issues = conn.execute(
+        f"""
+        SELECT arrival_no, side, reason, ref, detail
+          FROM arrival_issues
+         WHERE arrival_no IN ({marks})
+         ORDER BY arrival_no, side, reason, ref
+        """,
+        tuple(keys),
+    ).fetchall()
+    by_arrival: dict[str, list[dict]] = {key: [] for key in keys}
+    from .csvio import human_reason, human_side
+
+    for issue in issues:
+        by_arrival[issue["arrival_no"]].append(
+            {
+                **dict(issue),
+                "reason_label": human_reason(issue["reason"]),
+                "side_label": human_side(issue["side"]),
+            }
+        )
+    rows: list[dict] = []
+    for arrival in arrivals:
+        row = dict(arrival)
+        own_issues = by_arrival.get(arrival["arrival_no"], [])
+        row["issue_count"] = len(own_issues)
+        row["released"] = not own_issues
+        row["issues"] = own_issues
+        rows.append(row)
+    return rows
 
 
 def arrival_detail(conn: sqlite3.Connection, arrival_no: str) -> dict | None:

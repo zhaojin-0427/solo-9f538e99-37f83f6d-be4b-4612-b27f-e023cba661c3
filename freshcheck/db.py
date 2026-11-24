@@ -10,6 +10,11 @@ Design notes
   orders keep an *agreed* barcode.  Correction of either can change the
   verdict of an arrival, therefore ``recheck_arrivals`` is used after every
   write to recompute the set of blocking reasons for affected arrivals.
+* ``arrival_search`` is an FTS5 *external-content* trigram index over the
+  three columns the arrivals lookup searches.  The ``arrivals`` table stays
+  the single source of truth; triggers feed the index in the same SQLite
+  transaction as the upload, so a failed upload cannot leave a half-updated
+  index behind.  Older database files are backfilled once (see ``_migrate``).
 """
 
 from __future__ import annotations
@@ -20,6 +25,9 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 
 DB_PATH = os.environ.get("FRESHCHECK_DB", os.path.join(os.path.dirname(__file__), "..", "data", "freshcheck.db"))
+
+SEARCH_INDEX_KEY = "arrival_search_version"
+SEARCH_INDEX_VERSION = "1"
 
 SCHEMA = """
 PRAGMA journal_mode = WAL;
@@ -55,6 +63,34 @@ CREATE INDEX IF NOT EXISTS idx_scan_barcode ON scan_records (barcode);
 CREATE INDEX IF NOT EXISTS idx_arrival_line ON arrivals (po_line_no);
 CREATE INDEX IF NOT EXISTS idx_arrival_barcode ON arrivals (barcode);
 
+-- Trigram full-text index for the arrivals lookup.  It is *external content*:
+-- rows live in ``arrivals`` and are addressed by that table's ``rowid``.  The
+-- triggers keep it in lock-step with every insert/update/delete inside the
+-- caller's transaction (no separate write path to forget).  Only the three
+-- searched columns are indexed; the release flag is never duplicated here.
+CREATE VIRTUAL TABLE IF NOT EXISTS arrival_search USING fts5(
+    arrival_no, po_line_no, barcode,
+    content='arrivals', content_rowid='rowid', tokenize='trigram'
+);
+
+CREATE TRIGGER IF NOT EXISTS arrival_search_ai AFTER INSERT ON arrivals BEGIN
+    INSERT INTO arrival_search(rowid, arrival_no, po_line_no, barcode)
+    VALUES (new.rowid, new.arrival_no, new.po_line_no, new.barcode);
+END;
+
+CREATE TRIGGER IF NOT EXISTS arrival_search_ad AFTER DELETE ON arrivals BEGIN
+    INSERT INTO arrival_search(arrival_search, rowid, arrival_no, po_line_no, barcode)
+    VALUES ('delete', old.rowid, old.arrival_no, old.po_line_no, old.barcode);
+END;
+
+CREATE TRIGGER IF NOT EXISTS arrival_search_au
+AFTER UPDATE OF arrival_no, po_line_no, barcode ON arrivals BEGIN
+    INSERT INTO arrival_search(arrival_search, rowid, arrival_no, po_line_no, barcode)
+    VALUES ('delete', old.rowid, old.arrival_no, old.po_line_no, old.barcode);
+    INSERT INTO arrival_search(rowid, arrival_no, po_line_no, barcode)
+    VALUES (new.rowid, new.arrival_no, new.po_line_no, new.barcode);
+END;
+
 -- Blocking reasons are derived, but cached so the list views are cheap and
 -- stable.  The cache is recomputed inside the same transaction as the write
 -- (only for the affected arrivals), so base tables, worklists and release
@@ -78,6 +114,12 @@ CREATE TABLE IF NOT EXISTS upload_batches (
     received_at     TEXT NOT NULL,
     status          TEXT NOT NULL,             -- 'committed' | 'failed'
     note            TEXT                       -- failure reason, if any
+);
+
+-- One-off migration bookkeeping (e.g. "the search index was backfilled").
+CREATE TABLE IF NOT EXISTS schema_meta (
+    key             TEXT PRIMARY KEY,
+    value           TEXT NOT NULL
 );
 """
 
@@ -151,8 +193,20 @@ def init_db(path: str | None = None) -> None:
         try:
             conn = connect(target)
             try:
+                # ``executescript`` commits first and runs in autocommit mode;
+                # all schema statements are idempotent, so a crash there is
+                # harmless.  The data migration (timestamp normalisation and
+                # the one-off search backfill with its version marker) then
+                # runs in a single explicit transaction: it is applied in full
+                # or not at all.
                 conn.executescript(SCHEMA)
-                _migrate(conn)
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    _migrate(conn)
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
             finally:
                 conn.close()
             return
@@ -180,6 +234,28 @@ def _migrate(conn: sqlite3.Connection) -> None:
             f"UPDATE {table} SET {column} = substr({column}, 1, 19) || '.000000Z' "
             f"WHERE length({column}) = 20 AND {column} LIKE '%Z'"
         )
+
+    _ensure_search_index(conn)
+
+
+def _ensure_search_index(conn: sqlite3.Connection) -> None:
+    """Backfill the trigram index once for database files created before it.
+
+    Rows written through the triggers after this point are indexed inline.
+    The rebuild and the version marker commit together with the rest of the
+    migration, so a crash leaves the marker unset and the next start retries.
+    """
+    row = conn.execute(
+        "SELECT value FROM schema_meta WHERE key = ?", (SEARCH_INDEX_KEY,)
+    ).fetchone()
+    if row is not None and row["value"] == SEARCH_INDEX_VERSION:
+        return
+    conn.execute("INSERT INTO arrival_search(arrival_search) VALUES('rebuild')")
+    conn.execute(
+        "INSERT INTO schema_meta (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (SEARCH_INDEX_KEY, SEARCH_INDEX_VERSION),
+    )
 
 
 @contextmanager

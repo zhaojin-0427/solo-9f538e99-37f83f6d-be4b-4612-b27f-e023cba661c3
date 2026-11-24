@@ -3,9 +3,22 @@
 {% block content %}
 <h2>到货查询</h2>
 <form class="search" method="get" action="{{ url_for('arrivals') }}">
-  <input type="search" name="q" value="{{ query }}" placeholder="到货编号 / 采购行号 / 条码">
+  <input type="search" name="q" value="{{ query }}" placeholder="编号片段（3～8 位字母/数字）/ 到货编号 / 采购行号 / 条码">
   <button type="submit">查询</button>
 </form>
+<p class="hint">
+  输入 3～8 位英文字母或数字的片段时，会在到货编号、采购行号和扫码条码中做包含匹配（忽略英文大小写），
+  按到货编号排序、每页最多 {{ page_size }} 笔；一笔到货多处命中只列一次。
+  其他输入仍按原来的到货编号 / 采购行号 / 条码包含查询。
+</p>
+
+{% if fragment %}
+<p class="hint">
+  片段 <code>{{ fragment }}</code> 命中 {{ total }} 笔
+  {%- if after %}；当前为 <code>{{ after }}</code> 之后的记录{% endif %}。
+</p>
+{% endif %}
+
 {% if rows %}
 <table>
   <thead>
@@ -23,13 +36,35 @@
           <span class="badge ok">放行</span>
         {% else %}
           <span class="badge danger">受阻 · {{ row.issue_count }}</span>
+          {% if row.issues %}
+          <ul class="reasons">
+            {% for issue in row.issues %}
+            <li>{{ issue.reason_label }}{% if issue.ref %}（<code>{{ issue.ref }}</code>）{% endif %}</li>
+            {% endfor %}
+          </ul>
+          {% endif %}
         {% endif %}
       </td>
     </tr>
     {% endfor %}
   </tbody>
 </table>
+{% if fragment and (after or has_more) %}
+<nav class="pager">
+  {% if after %}
+    <a href="{{ url_for('arrivals', q=query) }}">« 第一页</a>
+  {% endif %}
+  {% if has_more %}
+    <a href="{{ url_for('arrivals', q=query, after=next_after) }}">下一页（{{ next_after }} 之后） »</a>
+  {% else %}
+    <span class="hint">已到最后一页。</span>
+  {% endif %}
+</nav>
+{% endif %}
 {% else %}
-<p class="empty">没有匹配的到货记录。</p>
+<p class="empty">
+  {% if fragment and total %}片段 <code>{{ fragment }}</code> 共命中 {{ total }} 笔，但已无更多内容。
+  {% else %}没有匹配的到货记录。{% endif %}
+</p>
 {% endif %}
 {% endblock %}
